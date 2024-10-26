@@ -7,6 +7,7 @@
 #include <strings.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "liburing.h"
@@ -20,6 +21,17 @@ void add_accept(struct io_uring *ring, int fd, struct sockaddr *client_addr, soc
 void add_socket_read(struct io_uring *ring, int fd, unsigned gid, size_t size, unsigned flags);
 void add_socket_write(struct io_uring *ring, int fd, __u16 bid, size_t size, unsigned flags);
 void add_provide_buf(struct io_uring *ring, __u16 bid, unsigned gid);
+
+#define RESPONSE_BODY "Hello, world!\n"
+#define SERVER "toyserver"
+#define HTTP_DATE_BUF_LEN sizeof("Sun, 06 Nov 1994 08:49:37 GMT")
+
+static char *trim_left_space(char *s, int n);
+static char *find_crlf(char *s, int n);
+static int has_connection_close(char *req, int n);
+static time_t get_now();
+static int format_http_date(time_t now, char buffer[HTTP_DATE_BUF_LEN]);
+static int format_response(char *buf, int buf_len, const char *date, int date_len);
 
 enum {
     ACCEPT,
@@ -113,6 +125,10 @@ int main(int argc, char *argv[]) {
     // add first accept SQE to monitor for new incoming connections
     add_accept(&ring, sock_listen_fd, (struct sockaddr *)&client_addr, &client_len, 0);
 
+    char date_buf[HTTP_DATE_BUF_LEN];
+    int date_len;
+    time_t prev_now = 0;
+
     // start event loop
     while (1) {
         io_uring_submit_and_wait(&ring, 1);
@@ -154,8 +170,17 @@ int main(int argc, char *argv[]) {
                     // connection closed or error
                     close(conn_i.fd);
                 } else {
+                    // int closing = has_connection_close(bufs[bid], bytes_read);
+                    // printf("closing=%d\n", closing);
+
+                    time_t now = get_now();
+                    if (now != prev_now) {
+                        date_len = format_http_date(now, date_buf);
+                        prev_now = now;
+                    }
+                    int resp_len = format_response(bufs[bid], MAX_MESSAGE_LEN, date_buf, date_len);
                     // bytes have been read into bufs, now add write to socket sqe
-                    add_socket_write(&ring, conn_i.fd, bid, bytes_read, 0);
+                    add_socket_write(&ring, conn_i.fd, bid, resp_len, 0);
                 }
             } else if (type == WRITE) {
                 // write has been completed, first re-add the buffer
@@ -216,4 +241,108 @@ void add_provide_buf(struct io_uring *ring, __u16 bid, unsigned gid) {
         .type = PROV_BUF,
     };
     memcpy(&sqe->user_data, &conn_i, sizeof(conn_i));
+}
+
+static char *trim_left_space(char *s, int n) {
+  char *end = s + n;
+  while (s < end && *s == ' ') {
+    s++;
+  }
+  return s;
+}
+
+#define CONNECTION "connection"
+#define CONNECTION_LEN (sizeof(CONNECTION) - 1)
+#define CLOSE "close"
+#define CLOSE_LEN (sizeof(CLOSE) - 1)
+
+static char *find_crlf(char *s, int n) {
+  char *p = memchr(s, '\r', n);
+  if (p != NULL && p + 1 < s + n && p[1] == '\n') {
+    return p;
+  }
+  return NULL;
+}
+
+static int has_connection_close(char *req, int n) {
+  // printf("has_connection_close start, req=[%.*s]\n", n, req);
+  char *field_end = find_crlf(req, n);
+  if (field_end == NULL) {
+    return 0;
+  }
+  n -= (field_end - req) + 2;
+  char *p = field_end + 2;
+  while ((field_end = find_crlf(p, n)) != NULL) {
+    // printf("=== req=[%.*s], field_end=[%.*s], end_pos=%ld\n", n, req, (int)(n - (field_end - req)), field_end, field_end - req);
+    if (field_end == p) {
+      break;
+    }
+
+    if (p + CONNECTION_LEN + 1 < field_end &&
+        (p[0] | 0x20) == 'c' &&
+        (p[1] | 0x20) == 'o' &&
+        (p[2] | 0x20) == 'n' &&
+        (p[3] | 0x20) == 'n' &&
+        (p[4] | 0x20) == 'e' &&
+        (p[5] | 0x20) == 'c' &&
+        (p[6] | 0x20) == 't' &&
+        (p[7] | 0x20) == 'i' &&
+        (p[8] | 0x20) == 'o' &&
+        (p[9] | 0x20) == 'n' &&
+        p[10] == ':')
+    {
+      // printf("= colon+1=[%.*s]\n", (int)(field_end - colon - 1), colon + 1);
+      p += CONNECTION_LEN + 1;
+      p = trim_left_space(p, field_end - p);
+      // printf("val=[%.*s]\n", (int)(field_end - val), val);
+      int val_len = field_end - p;
+      if (p + CLOSE_LEN <= field_end &&
+          (p[0] | 0x20) == 'c' &&
+          (p[1] | 0x20) == 'l' &&
+          (p[2] | 0x20) == 'o' &&
+          (p[3] | 0x20) == 's' &&
+          (p[4] | 0x20) == 'e' &&
+          trim_left_space(p + CLOSE_LEN, val_len - CLOSE_LEN) == field_end)
+      {
+        return 1;
+      }
+    }
+
+    n -= (field_end - p) + 2;
+    p = field_end + 2;
+  }
+  return 0;
+}
+
+static time_t get_now() {
+  struct timeval tv;
+
+  gettimeofday(&tv, NULL);
+  return tv.tv_sec;
+}
+
+static int format_http_date(time_t now, char buffer[HTTP_DATE_BUF_LEN]) {
+  struct tm *tm;
+
+  tm = gmtime(&now);
+  if (tm == NULL) {
+    perror("gmtime failed");
+    exit(1);
+  }
+  return (int)strftime(buffer, HTTP_DATE_BUF_LEN, "%a, %d %b %Y %H:%M:%S GMT",
+                       tm);
+}
+
+static int format_response(char *buf, int buf_len, const char *date, int date_len) {
+  return snprintf(buf, buf_len,
+    "HTTP/1.1 200 OK\r\n"
+    "Date: %.*s\r\n"
+    "Server: %.*s\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: %ld\r\n"
+    "\r\n"
+    "%s",
+    date_len, date,
+    (int)(sizeof(SERVER) - 1), SERVER,
+    sizeof(RESPONSE_BODY) - 1, RESPONSE_BODY);
 }
